@@ -1,0 +1,73 @@
+name: Turath Library Database & Size Analyzer
+
+on:
+  workflow_dispatch:
+    inputs:
+      concurrency:
+        description: "Concurrent HTTP requests (e.g., 40)"
+        required: false
+        default: "40"
+      limit:
+        description: "Limit books count for testing (0 = ALL books)"
+        required: false
+        default: "0"
+      commit_results:
+        description: "Commit generated reports & ZIP back to repository?"
+        required: false
+        default: "true"
+  schedule:
+    # Runs automatically on the 1st of every month at 02:00 UTC
+    - cron: "0 2 1 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  analyze-turath:
+    name: Analyze Turath Text & PDF Sizes
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install aiohttp
+
+      - name: Run Turath Database Analyzer
+        run: |
+          python turath_analyzer.py \
+            --output-dir output \
+            --concurrency "${{ github.event.inputs.concurrency || '40' }}" \
+            --limit "${{ github.event.inputs.limit || '0' }}"
+
+      - name: Upload ZIP Report as GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turath-database-stats-zip
+          path: |
+            output/turath_database_stats.zip
+            output/summary.json
+            output/REPORT.md
+          retention-days: 90
+
+      - name: Commit & Push Reports to Repository
+        if: ${{ github.event.inputs.commit_results != 'false' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/
+          if git diff --staged --quiet; then
+            echo "No changes in database statistics."
+          else
+            git commit -m "chore(data): update Turath library text and PDF size statistics"
+            git push
+          fi
