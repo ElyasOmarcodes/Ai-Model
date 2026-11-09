@@ -1,19 +1,36 @@
 #!/usr/bin/env bash
 # Studio / broadcast-style mastering chain for voice recordings.
-# Usage: ./studio_master.sh input.(mp3|wav) output.mp3
+# Usage: ./studio_master.sh input.(mp3|wav) output.mp3 [normal|strong]
+#   normal : clean broadcast voice, subtle room
+#   strong : bigger "show" sound - longer/louder plate, more air & warmth,
+#            harmonic exciter, wider stereo image, firmer compression
 # Requires: ffmpeg (sox optional for analysis)
 set -euo pipefail
-IN="$1"; OUT="$2"
+IN="$1"; OUT="$2"; PRESET="${3:-normal}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 
-# 1) Synthetic stereo "plate" impulse response (decorrelated L/R, ~1.6 s tail, 18 ms pre-delay)
+if [ "$PRESET" = "strong" ]; then
+  IR_LEN=2.4; PREDELAY="30|41"; IR_LP=8500; WET=0.075
+  LOW_G=3.0; MUD_G=-3.5; PRES_G=3.5; AIR_G=5.0
+  EXCITER="aexciter=amount=1.2:drive=6:freq=3500:blend=0,"
+  COMP1="threshold=-24dB:ratio=4:attack=6:release=110:knee=4:makeup=4"
+  WIDTH="stereowiden=delay=18:feedback=0.15:crossfeed=0.25:drymix=0.9"
+else
+  IR_LEN=1.6; PREDELAY="18|23"; IR_LP=7000; WET=0.035
+  LOW_G=2.0; MUD_G=-3.0; PRES_G=2.5; AIR_G=3.5
+  EXCITER=""
+  COMP1="threshold=-22dB:ratio=3.5:attack=8:release=120:knee=4:makeup=3"
+  WIDTH="extrastereo=m=1.15"
+fi
+
+# 1) Synthetic stereo "plate" impulse response (decorrelated L/R noise with exponential decay)
 ffmpeg -hide_banner -loglevel error -y \
-  -f lavfi -i "anoisesrc=d=1.6:c=pink:r=44100:a=0.5:seed=11" \
-  -f lavfi -i "anoisesrc=d=1.6:c=pink:r=44100:a=0.5:seed=97" \
+  -f lavfi -i "anoisesrc=d=$IR_LEN:c=pink:r=44100:a=0.5:seed=11" \
+  -f lavfi -i "anoisesrc=d=$IR_LEN:c=pink:r=44100:a=0.5:seed=97" \
   -filter_complex "[0][1]join=inputs=2:channel_layout=stereo,
-     afade=t=out:st=0:d=1.6:curve=exp,
-     lowpass=f=7000,highpass=f=250,
-     adelay=18|23[ir]" -map "[ir]" "$TMP/ir.wav"
+     afade=t=out:st=0:d=$IR_LEN:curve=exp,
+     lowpass=f=$IR_LP,highpass=f=250,
+     adelay=$PREDELAY[ir]" -map "[ir]" "$TMP/ir.wav"
 
 # 2) Clean-up + vocal EQ + de-ess + compression (dry voice chain)
 ffmpeg -hide_banner -loglevel error -y -i "$IN" -af "
@@ -21,21 +38,22 @@ ffmpeg -hide_banner -loglevel error -y -i "$IN" -af "
   volume=-3dB,
   highpass=f=75:poles=2,
   afftdn=nf=-30:nr=10:tn=1,
-  equalizer=f=120:t=q:w=1.0:g=2.0,
-  equalizer=f=320:t=q:w=1.2:g=-3.0,
-  equalizer=f=3200:t=q:w=1.0:g=2.5,
-  highshelf=f=10000:g=3.5,
+  equalizer=f=120:t=q:w=1.0:g=$LOW_G,
+  equalizer=f=320:t=q:w=1.2:g=$MUD_G,
+  equalizer=f=3200:t=q:w=1.0:g=$PRES_G,
+  highshelf=f=10000:g=$AIR_G,
+  $EXCITER
   deesser=i=0.4:m=0.5:f=0.5,
-  acompressor=threshold=-22dB:ratio=3.5:attack=8:release=120:knee=4:makeup=3,
+  acompressor=$COMP1,
   acompressor=threshold=-10dB:ratio=6:attack=2:release=60:knee=2
 " -c:a pcm_f32le "$TMP/dry.wav"
 
-# 3) Reverb send (wet ~15 dB below dry) + subtle stereo width, then mix with dry
+# 3) Reverb send + stereo width, then mix with dry
 ffmpeg -hide_banner -loglevel error -y -i "$TMP/dry.wav" -i "$TMP/ir.wav" -filter_complex "
   [0]asplit=2[d][s];
   [s][1]afir=dry=1:wet=1:gtype=none[w0];
-  [w0]highpass=f=300,volume=0.035[w];
-  [d]extrastereo=m=1.15[d2];
+  [w0]highpass=f=300,volume=$WET[w];
+  [d]$WIDTH[d2];
   [d2][w]amix=inputs=2:weights=1 1:normalize=0[m]
 " -map "[m]" -c:a pcm_f32le "$TMP/mix.wav"
 
