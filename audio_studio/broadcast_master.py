@@ -36,7 +36,8 @@ def read(path):
 
 
 def write(path, x):
-    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "f32le", "-ac", "1", "-ar", str(SR),
+    x = np.asarray(x)
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "f32le", "-ac", str(1 if x.ndim == 1 else x.shape[1]), "-ar", str(SR),
                     "-i", "-", "-c:a", "pcm_f32le", path], input=np.asarray(x, np.float32).tobytes(), check=True)
 
 
@@ -116,6 +117,19 @@ def breath_gain(x, depth_db=18.0):
     return g, (g_db < -10).mean()
 
 
+def room(y, rt60=0.45, wet_db=-22.0, seed=3):
+    """Light studio ambience: short decorrelated stereo room tail, returns (n, 2)."""
+    n = int(rt60 * 1.2 * SR); t = np.arange(n) / SR
+    rng = np.random.default_rng(seed); f = np.fft.rfftfreq(n, 1 / SR)
+    shape = (f / 300) ** 2 / (1 + (f / 300) ** 2) / (1 + (f / 7000) ** 4)
+    N = 1 << (len(y) + n).bit_length(); Y = np.fft.rfft(y, N); out = []
+    for c in range(2):
+        h = np.fft.irfft(np.fft.rfft(rng.standard_normal(n)) * shape, n) * 10 ** (-3 * t / rt60)
+        h = np.concatenate([np.zeros(int((0.012 + 0.005 * c) * SR)), h]); h /= np.sqrt((h ** 2).sum())
+        out.append(y + np.fft.irfft(Y * np.fft.rfft(h, N), N)[:len(y)] * 10 ** (wet_db / 20))
+    return np.stack(out, 1)
+
+
 TONE = ",".join([
     "highpass=f=70:p=2", "highpass=f=70:p=2",
     # measured source: +8 dB at 120-500 Hz vs 500-1k, -12..-20 dB missing above 2 kHz.
@@ -147,6 +161,7 @@ def main():
     p.add_argument("--rnn", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "std.rnnn"))
     p.add_argument("--breath-depth", type=float, default=18.0)
     p.add_argument("--lufs", type=float, default=-14.0)
+    p.add_argument("--room", type=float, default=None, help="add light studio room, wet level in dB (e.g. -22)")
     a = p.parse_args()
 
     x = read(a.inp)
@@ -177,6 +192,8 @@ def main():
         y = process(y, DEPLOSIVE, tmp, "dep", graph=True)
         y = process(y, DENSITY, tmp, "dens", graph=True)
         y = align(y, dn) * gain  # breath / smack suppression after all dynamics
+        if a.room is not None:
+            y = room(y, wet_db=a.room)
         # --- loudness / limiting / export ---------------------------------
         mixp = os.environ.get("BM_KEEP_MIX") or os.path.join(tmp, "mix.wav"); write(mixp, y)
         L = a.lufs

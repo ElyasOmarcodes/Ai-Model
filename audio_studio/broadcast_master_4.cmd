@@ -5,3 +5,4 @@
 #   https://raw.githubusercontent.com/richardpl/arnndn-models/master/std.rnnn
 python3 audio_studio/broadcast_master.py INPUT audio_studio/broadcast_master_4 \
   --cut 103.5:107.6 --cut 120.55:132.6 --cut 202.95:245.45:0.45
+# studio version (broadcast_master_4_studio.mp3): same command plus  --room -22
