@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Broadcast/YouTube voice-over mastering with retake removal and quoted-voice styling.
+"""Natural broadcast/YouTube voice-over cleanup for phone-mic recordings.
+
+No reverb and no voice changing: the speaker's own voice is kept and only
+cleaned up, thickened and levelled.
 
 Pipeline
   1. decode to 48 kHz mono float
   2. remove retakes (--cut a:b[:pad]) with short fades; pad = seconds of silence inserted
-  3. corrective "bad mic" chain: high-pass, de-plosive (low-band compressor),
-     corrective EQ (de-mud + restore presence/air), harmonic exciter, de-esser,
-     light denoise, gentle compression
-  4. quoted passages (--quote a:b:style, times in ORIGINAL file) are routed to a
-     separate voice chain so they read as another speaker:
-        speech : deeper pitch, "archival speech" EQ + warmth, large hall
-        phone  : slightly higher pitch, telephone/radio band, grit, small room
-     the narrator gets a subtle stereo plate
-  5. sum, two-pass loudness normalisation to -14 LUFS / -1.5 dBTP, export
+  3. RNNoise denoise (arnndn) + click repair (adeclick)
+  4. tone: rumble high-pass, warm/full low end (+body at 100-200 Hz), gentle presence,
+     multiband de-esser, de-plosive, parallel compression for density
+  5. breath / lip-smack suppressor (see breath_gain): unvoiced, quiet frames away from
+     words and short isolated mouth clicks in pauses are turned down ~18 dB
+  6. two-pass loudness normalisation to -14 LUFS / -1.5 dBTP, export
 
 Usage
-  broadcast_master.py IN OUT_BASENAME --cut 103.5:107.6 --quote 23.45:27.7:speech ...
+  broadcast_master.py IN OUT_BASENAME [--cut a:b[:pad]] ... [--rnn MODEL.rnnn]
 Writes OUT_BASENAME.mp3 (320k, 48 kHz) and OUT_BASENAME.wav (24-bit, 48 kHz).
-Requires ffmpeg (with rubberband) and numpy.
+Requires ffmpeg and numpy; RNNoise models: https://github.com/richardpl/arnndn-models (std.rnnn)
 """
 import argparse, json, os, re, subprocess, tempfile
 import numpy as np
@@ -29,18 +29,15 @@ def ff(*args):
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args], check=True)
 
 
-def read(path, ch=1):
+def read(path):
     raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-i", path, "-f", "f32le",
-                          "-ac", str(ch), "-ar", str(SR), "-"], capture_output=True, check=True).stdout
-    x = np.frombuffer(raw, np.float32).astype(np.float64)
-    return x.reshape(-1, ch) if ch > 1 else x
+                          "-ac", "1", "-ar", str(SR), "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.float32).astype(np.float64)
 
 
 def write(path, x):
-    x = np.asarray(x, np.float32)
-    ch = 1 if x.ndim == 1 else x.shape[1]
-    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "f32le", "-ac", str(ch), "-ar", str(SR),
-                    "-i", "-", "-c:a", "pcm_f32le", path], input=x.tobytes(), check=True)
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "f32le", "-ac", "1", "-ar", str(SR),
+                    "-i", "-", "-c:a", "pcm_f32le", path], input=np.asarray(x, np.float32).tobytes(), check=True)
 
 
 def process(x, chain, tmp, name, graph=False):
@@ -48,195 +45,152 @@ def process(x, chain, tmp, name, graph=False):
     write(a, x)
     ff("-i", a, "-filter_complex" if graph else "-af", chain, "-ar", str(SR), "-c:a", "pcm_f32le", b)
     y = read(b)
-    n = len(x)
-    return np.pad(y, (0, max(0, n - len(y))))[:n]
+    return np.pad(y, (0, max(0, len(x) - len(y))))[:len(x)]
 
 
-def lag_of(y, ref, max_lag=0.2):
-    """Delay (samples) of y relative to ref, by cross-correlation of 1 ms envelopes, then refined."""
+def align(y, ref, max_lag=0.2):
+    """Undo any processing latency (1 ms envelope cross-correlation)."""
     h = SR // 1000
     def env(v):
         n = len(v) // h * h
-        return np.log(np.sqrt((v[:n].reshape(-1, h) ** 2).mean(1)) + 1e-4)
+        e = np.log(np.sqrt((v[:n].reshape(-1, h) ** 2).mean(1)) + 1e-4)
+        return e - e.mean()
     a, b = env(ref), env(y)
-    n = min(len(a), len(b)); a, b = a[:n] - a[:n].mean(), b[:n] - b[:n].mean()
+    n = min(len(a), len(b)); a, b = a[:n], b[:n]
     N = 1 << (2 * n).bit_length()
     c = np.fft.irfft(np.fft.rfft(b, N) * np.conj(np.fft.rfft(a, N)), N)
     L = int(max_lag * 1000)
     lags = np.r_[np.arange(0, L + 1), np.arange(-L, 0)]
-    return int(lags[np.argmax(np.r_[c[:L + 1], c[-L:]])] * h)
+    d = int(lags[np.argmax(np.r_[c[:L + 1], c[-L:]])] * h)
+    return np.concatenate([y[d:], np.zeros(d)]) if d > 0 else np.concatenate([np.zeros(-d), y[:len(y) + d]])
 
 
-def align(y, ref):
-    d = lag_of(y, ref)
-    y = np.concatenate([y[d:], np.zeros(d)]) if d > 0 else np.concatenate([np.zeros(-d), y[:len(y) + d]])
-    return y
+def breath_gain(x, depth_db=18.0):
+    """Per-sample gain that ducks breaths, lip smacks and low-level noise between words.
+
+    Analysis on 5 ms frames (30 ms windows): level relative to the local speech level
+    (95th percentile over 3 s) and voicing (normalised autocorrelation peak, 60-400 Hz).
+    Frames above -32 dB rel are grouped into contiguous runs:
+      * run containing voiced frames -> speech, untouched (incl. attached kh/sh/s/h sounds)
+        plus 30 ms before / 60 ms after
+      * unvoiced run, isolated from words -> breath, lip smack or noise burst: full duck
+        (only a light -6 dB if it is longer than 40 ms and louder than -20 dB rel)
+    Everything quieter than -32 dB rel outside speech (noise floor) is fully ducked.
+    """
+    hp = x - np.convolve(x, np.ones(240) / 240, "same")  # crude <200 Hz removal for analysis
+    hop, W, fs = 240, 1440, 0.005
+    n = max(0, (len(x) - W) // hop)
+    fr = np.lib.stride_tricks.sliding_window_view(hp, W)[::hop][:n]
+    lv = 10 * np.log10((fr ** 2).mean(1) + 1e-12)
+    F = np.fft.rfft(fr * np.hanning(W), 2 * W, axis=1)
+    ac = np.fft.irfft(np.abs(F) ** 2, axis=1)[:, :W]
+    ac /= ac[:, :1] + 1e-12
+    v = ac[:, SR // 400:SR // 60].max(1)
+    k = 600
+    ref = np.array([np.percentile(lv[max(0, i - k // 2):i + k // 2], 95) for i in range(0, n, 50)])
+    rel = lv - np.repeat(ref, 50)[:n]
+    voiced = (v > 0.5) & (rel > -30)
+    # contiguous "active" runs (> -32 dB rel, gaps <= 10 ms bridged); a run that contains
+    # voicing is speech (fricatives attached to words included) and is never touched
+    active = rel > -32
+    for gap in (1, 2):
+        active[1:-gap] |= active[:-gap - 1] & active[gap + 1:]
+    g_db = np.full(n, -depth_db)
+    i = 0
+    while i < n:
+        if active[i]:
+            j = i
+            while j < n and active[j]: j += 1
+            if voiced[i:j].any():
+                g_db[max(0, i - 6):j + 12] = 1.0  # speech: protect, +30 ms before / +60 ms after
+            elif (j - i) * fs > 0.04 and rel[i:j].max() >= -20:
+                g_db[i:j] = np.minimum(g_db[i:j], -6.0)  # loud isolated unvoiced sound: light duck
+            # else: breath / smack / noise burst -> stays at -depth
+            i = j
+        else:
+            i += 1
+    g_db = np.minimum(g_db, 0.0)
+    g_db = np.convolve(g_db, np.ones(3) / 3, "same")  # 15 ms smoothing in dB
+    t_frames = (np.arange(n) * hop + W / 2) / SR
+    g = 10 ** (np.interp(np.arange(len(x)) / SR, t_frames, g_db) / 20)
+    return g, (g_db < -10).mean()
 
 
-def ramp_mask(n, regions, fade=0.02):
-    """1 inside regions, raised-cosine ramps of `fade` s centred on the edges."""
-    t = np.arange(n) / SR
-    m = np.zeros(n)
-    for a, b in regions:
-        up = np.clip((t - (a - fade / 2)) / fade, 0, 1)
-        dn = np.clip(((b + fade / 2) - t) / fade, 0, 1)
-        m = np.maximum(m, np.minimum(up, dn))
-    return 0.5 - 0.5 * np.cos(np.pi * m)
+TONE = ",".join([
+    "highpass=f=70:p=2", "highpass=f=70:p=2",
+    # measured source: +8 dB at 120-500 Hz vs 500-1k, -12..-20 dB missing above 2 kHz.
+    # keep the body (thick/full), only trim boxiness at 300-650 Hz, restore presence moderately
+    "firequalizer=gain_entry='entry(0,0);entry(70,0);entry(100,2.5);entry(150,3);entry(200,2);"
+    "entry(300,-0.5);entry(450,-2);entry(650,-1.5);entry(900,0);entry(1300,1);entry(2000,3);"
+    "entry(2800,5);entry(3800,6);entry(5000,7.5);entry(6500,9);entry(8000,9);entry(10000,6);"
+    "entry(12000,1);entry(13000,0);entry(14000,-6);entry(24000,-12)'",
+])
 
-
-def reverb_ir(rt60, predelay, lo, hi, seed, length=None):
-    """Decorrelated stereo noise-tail IR, unit energy per channel."""
-    length = length or rt60 * 1.1
-    n = int(length * SR)
-    rng = np.random.default_rng(seed)
-    t = np.arange(n) / SR
-    env = 10 ** (-3 * t / rt60)
-    f = np.fft.rfftfreq(n, 1 / SR)
-    shape = np.where(f > 0, 1 / np.sqrt(np.maximum(f, 1)), 0)  # pink
-    shape *= 1 / (1 + (f / hi) ** 4) * (f / lo) ** 2 / (1 + (f / lo) ** 2)  # band-limit
-    out = []
-    for c in range(2):
-        w = np.fft.irfft(np.fft.rfft(rng.standard_normal(n)) * shape, n) * env
-        w = np.concatenate([np.zeros(int((predelay + 0.004 * c) * SR)), w])
-        out.append(w / np.sqrt((w ** 2).sum()))
-    L = max(len(o) for o in out)
-    return np.stack([np.pad(o, (0, L - len(o))) for o in out], 1)
-
-
-def convolve(x, ir):
-    n = len(x) + len(ir) - 1
-    N = 1 << (n - 1).bit_length()
-    X = np.fft.rfft(x, N)
-    return np.stack([np.fft.irfft(X * np.fft.rfft(ir[:, c], N), N)[:len(x)] for c in range(2)], 1)
-
-
-def rms(x, m):
-    w = m > 0.99
-    return np.sqrt((x[w] ** 2).mean()) if w.any() else 1.0
-
-
-CLEAN_STEPS = [
-    "volume=-4dB",
-    "highpass=f=75:p=2", "highpass=f=75:p=2",
-    # corrective EQ (measured: +8 dB boom at 120-500 Hz, -12..-20 dB missing above 2 kHz):
-    # de-mud / de-box, restore presence and air lost by the mic + low-bitrate codec
-    "firequalizer=gain_entry='entry(0,0);entry(100,0);entry(150,-3);entry(200,-5);entry(300,-6);"
-    "entry(450,-4);entry(650,-1.5);entry(900,0);entry(1300,1.5);entry(2000,4);entry(2800,6.5);"
-    "entry(3800,8);entry(5000,10);entry(6500,12);entry(8000,13);entry(9500,12);entry(11000,9);"
-    "entry(12000,5);entry(13000,0);entry(14000,-6);entry(24000,-12)'",
-    "afftdn=nf=-55:nr=8:tn=1",  # (CLEAN_STEPS index split point: DEESS graph runs before this)
-    "acompressor=threshold=-20dB:ratio=2.5:attack=10:release=150:knee=4:makeup=2",
-]
-CLEAN = ",".join(CLEAN_STEPS)
-
-# parallel exciter: saturate the 3-7 kHz band and add back only the new harmonics above 7 kHz
-EXCITER = ("asplit=2[d][e];[e]highpass=f=3000:p=2,highpass=f=3000:p=2,volume=12dB,"
-           "asoftclip=type=tanh:threshold=0.3,highpass=f=7000:p=2,highpass=f=7000:p=2,"
-           "lowpass=f=15000:p=2,lowpass=f=15000:p=2,volume=-12dB[h];[d][h]amix=inputs=2:weights=1 0.6:normalize=0")
-
-# de-esser: compress only the 5.5 kHz+ band (ffmpeg's deesser filter adds clicks at word onsets)
 DEESS = ("acrossover=split=5500:order=4th[l][h];"
          "[h]acompressor=threshold=-36dB:ratio=5:attack=1:release=50:knee=3[h2];"
          "[l][h2]amix=inputs=2:normalize=0")
 
-# de-plosive: compress only the band below 150 Hz, fast
 DEPLOSIVE = ("asplit=2[a][b];[a]lowpass=f=150:p=2,lowpass=f=150:p=2,"
-             "acompressor=threshold=-32dB:ratio=10:attack=2:release=60[lo];"
+             "acompressor=threshold=-28dB:ratio=8:attack=2:release=60[lo];"
              "[b]highpass=f=150:p=2,highpass=f=150:p=2[hi];[lo][hi]amix=inputs=2:normalize=0")
 
-STYLES = {
-    # pitch ratio, chain, reverb (rt60, predelay, lo, hi, wet dB), level offset dB vs narrator
-    "speech": dict(
-        chain="rubberband=pitch=0.89:formant=shifted:pitchq=quality,"
-              "highpass=f=140:p=2,lowpass=f=7000:p=2,"
-              "equalizer=f=220:t=q:w=1:g=3,equalizer=f=1600:t=q:w=1:g=3,"
-              "asoftclip=type=atan:threshold=0.6:output=1.2,lowpass=f=7500:p=2,"
-              "acompressor=threshold=-24dB:ratio=4:attack=5:release=100:makeup=3",
-        rev=(1.9, 0.035, 300, 6000, -10), level=-1.0),
-    "phone": dict(
-        chain="rubberband=pitch=1.06:formant=shifted:pitchq=quality,"
-              "highpass=f=380:p=2,highpass=f=380:p=2,lowpass=f=3300:p=2,lowpass=f=3300:p=2,"
-              "equalizer=f=1800:t=q:w=1.2:g=5,"
-              "asoftclip=type=tanh:threshold=0.4:output=1.4,lowpass=f=3600:p=2,lowpass=f=3600:p=2,"
-              "acompressor=threshold=-26dB:ratio=6:attack=3:release=80:makeup=4",
-        rev=(0.35, 0.008, 400, 3500, -17), level=-1.5),
-}
-NARRATOR_REV = (1.5, 0.02, 250, 8000, -19)
+# gentle bus compression + parallel ("New York") compression for a dense, full voice
+DENSITY = ("acompressor=threshold=-20dB:ratio=2:attack=12:release=180:knee=6:makeup=1.5,"
+           "asplit=2[d][p];[p]acompressor=threshold=-36dB:ratio=8:attack=4:release=120:makeup=10,"
+           "lowpass=f=6000[p2];[d][p2]amix=inputs=2:weights=1 0.35:normalize=0")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("inp"); p.add_argument("out")
     p.add_argument("--cut", action="append", default=[], help="a:b[:pad_seconds] in original time")
-    p.add_argument("--quote", action="append", default=[], help="a:b:style in original time")
+    p.add_argument("--rnn", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "std.rnnn"))
+    p.add_argument("--breath-depth", type=float, default=18.0)
+    p.add_argument("--lufs", type=float, default=-14.0)
     a = p.parse_args()
 
     x = read(a.inp)
-    # --- 1. retake removal -------------------------------------------------
+    # --- retake removal ---------------------------------------------------
     cuts = sorted(tuple(float(v) for v in c.split(":")) for c in a.cut)
-    pieces, tmap, pos, out_t = [], [], 0.0, 0.0
+    pieces, pos = [], 0.0
     f = int(0.01 * SR); fade = np.sin(np.linspace(0, np.pi / 2, f)) ** 2
     for c in cuts + [(len(x) / SR, None)]:
         seg = x[int(pos * SR):int(c[0] * SR)].copy()
         if pos > 0: seg[:f] *= fade
         if c[1] is not None: seg[-f:] *= fade[::-1]
-        tmap.append((pos, c[0], out_t - pos)); pieces.append(seg); out_t += len(seg) / SR
+        pieces.append(seg)
         if c[1] is not None:
-            pad = c[2] if len(c) > 2 else 0.0
-            pieces.append(np.zeros(int(pad * SR))); out_t += int(pad * SR) / SR
+            pieces.append(np.zeros(int((c[2] if len(c) > 2 else 0.0) * SR)))
             pos = c[1]
-    x = np.concatenate(pieces)
-
-    def mapt(t):
-        for s, e, off in tmap:
-            if s <= t <= e: return t + off
-        raise ValueError(f"time {t} falls inside a cut")
-
-    quotes = []
-    for q in a.quote:
-        s, e, st = q.split(":"); quotes.append((mapt(float(s)), mapt(float(e)), st))
+    x = np.concatenate(pieces) * 10 ** (-4 / 20)
 
     with tempfile.TemporaryDirectory() as tmp:
-        # --- 2. corrective chain ------------------------------------------
-        k = next(i for i, st in enumerate(CLEAN_STEPS) if st.startswith("afftdn"))
-        clean = process(x, ",".join(CLEAN_STEPS[:k]), tmp, "pre")
-        clean = process(clean, EXCITER, tmp, "exc", graph=True)
-        clean = process(clean, DEESS, tmp, "dess", graph=True)
-        clean = process(clean, ",".join(CLEAN_STEPS[k:]), tmp, "post")
-        clean = process(clean, DEPLOSIVE, tmp, "dep", graph=True)
-        clean = align(clean, x)
-
-        n = len(clean)
-        masks = {st: ramp_mask(n, [(s, e) for s, e, q in quotes if q == st]) for st in {q for *_, q in quotes}}
-        narr_m = 1 - sum(masks.values()) if masks else np.ones(n)
-
-        def with_reverb(dry, rev, seed):
-            rt, pre, lo, hi, wet_db = rev
-            wet = convolve(dry, reverb_ir(rt, pre, lo, hi, seed))
-            return dry[:, None] + wet * 10 ** (wet_db / 20)
-
-        narr_dry = clean * narr_m
-        mix = with_reverb(narr_dry, NARRATOR_REV, 1)
-        ref = rms(clean, narr_m)
-        for i, (st, m) in enumerate(masks.items()):
-            cfg = STYLES[st]
-            y = process(clean * m, cfg["chain"], tmp, st)
-            y = align(y, clean * m) * m  # re-align and re-mask after pitch shifting
-            y *= ref / rms(y, m) * 10 ** (cfg["level"] / 20)
-            mix += with_reverb(y, cfg["rev"], 10 + i)
-
-        # --- 3. loudness / limiting / export -------------------------------
-        mixp = os.environ.get("BM_KEEP_MIX") or os.path.join(tmp, "mix.wav"); write(mixp, mix)
+        # --- denoise + click repair ---------------------------------------
+        rnn = os.path.join(tmp, "m.rnnn")  # copy: arnndn's option parser dislikes ':' etc. in paths
+        with open(a.rnn, "rb") as s, open(rnn, "wb") as d:
+            d.write(s.read())
+        dn = align(process(x, f"arnndn=m={rnn}:mix=0.9,adeclick=w=20:o=75:t=3:b=2", tmp, "dn"), x)
+        gain, frac = breath_gain(dn, depth_db=a.breath_depth)
+        # --- tone & dynamics ----------------------------------------------
+        y = process(dn, TONE, tmp, "tone")
+        y = process(y, DEESS, tmp, "dess", graph=True)
+        y = process(y, DEPLOSIVE, tmp, "dep", graph=True)
+        y = process(y, DENSITY, tmp, "dens", graph=True)
+        y = align(y, dn) * gain  # breath / smack suppression after all dynamics
+        # --- loudness / limiting / export ---------------------------------
+        mixp = os.environ.get("BM_KEEP_MIX") or os.path.join(tmp, "mix.wav"); write(mixp, y)
+        L = a.lufs
         meas = subprocess.run(["ffmpeg", "-hide_banner", "-i", mixp, "-af",
-                               "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"],
+                               f"loudnorm=I={L}:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"],
                               capture_output=True, text=True).stderr
         j = json.loads(re.search(r"\{[^{}]*\}", meas[meas.rfind("[Parsed_loudnorm"):], re.S).group(0))
-        ln = (f"loudnorm=I=-14:TP=-1.5:LRA=11:measured_I={j['input_i']}:measured_TP={j['input_tp']}:"
+        ln = (f"loudnorm=I={L}:TP=-1.5:LRA=11:measured_I={j['input_i']}:measured_TP={j['input_tp']}:"
               f"measured_LRA={j['input_lra']}:measured_thresh={j['input_thresh']}:offset={j['target_offset']}:"
-              f"linear=true,alimiter=limit=0.84:attack=3:release=50:level=false,aresample={SR}")
+              f"linear=true,alimiter=limit=0.84:attack=3:release=50:level=false,aresample={SR},"
+              "aformat=channel_layouts=stereo")
         ff("-i", mixp, "-af", ln, "-c:a", "pcm_s24le", a.out + ".wav")
         ff("-i", a.out + ".wav", "-c:a", "libmp3lame", "-b:a", "320k", a.out + ".mp3")
-    print("quotes (output time):", [(round(s, 2), round(e, 2), q) for s, e, q in quotes])
+    print(f"breath/smack frames ducked: {frac * 100:.1f}%")
     print("done:", a.out + ".mp3", a.out + ".wav")
 
 
