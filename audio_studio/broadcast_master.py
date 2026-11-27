@@ -140,6 +140,18 @@ TONE = ",".join([
     "entry(12000,1);entry(13000,0);entry(14000,-6);entry(24000,-12)'",
 ])
 
+# warm preset: for bright/harsh, hissy sources (measured news.mp3: hump at 4-8 kHz, thin below 120 Hz)
+TONE_WARM = ",".join([
+    "highpass=f=60:p=2", "highpass=f=60:p=2",
+    "firequalizer=gain_entry='entry(0,0);entry(60,0);entry(80,4);entry(110,5);entry(160,4);entry(230,2);"
+    "entry(350,0);entry(500,-1);entry(800,0);entry(1500,0.5);entry(2500,1);entry(3500,0);entry(4500,-3);"
+    "entry(6000,-6);entry(7500,-6);entry(9000,-5);entry(11000,-4);entry(13000,-6);entry(24000,-12)'",
+    "afftdn=nf=-48:nr=12:tn=1",
+])
+DEESS_WARM = ("acrossover=split=4500:order=4th[l][h];"
+              "[h]acompressor=threshold=-34dB:ratio=6:attack=1:release=60:knee=3[h2];"
+              "[l][h2]amix=inputs=2:normalize=0")
+
 DEESS = ("acrossover=split=5500:order=4th[l][h];"
          "[h]acompressor=threshold=-36dB:ratio=5:attack=1:release=50:knee=3[h2];"
          "[l][h2]amix=inputs=2:normalize=0")
@@ -161,6 +173,7 @@ def main():
     p.add_argument("--rnn", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "std.rnnn"))
     p.add_argument("--breath-depth", type=float, default=18.0)
     p.add_argument("--lufs", type=float, default=-14.0)
+    p.add_argument("--warm", action="store_true", help="darker/thicker tone + stronger denoise for harsh sources")
     p.add_argument("--room", type=float, default=None, help="add light studio room, wet level in dB (e.g. -22)")
     a = p.parse_args()
 
@@ -184,11 +197,11 @@ def main():
         rnn = os.path.join(tmp, "m.rnnn")  # copy: arnndn's option parser dislikes ':' etc. in paths
         with open(a.rnn, "rb") as s, open(rnn, "wb") as d:
             d.write(s.read())
-        dn = align(process(x, f"arnndn=m={rnn}:mix=0.9,adeclick=w=20:o=75:t=3:b=2", tmp, "dn"), x)
+        dn = align(process(x, f"arnndn=m={rnn}:mix={1.0 if a.warm else 0.9},adeclick=w=20:o=75:t=3:b=2", tmp, "dn"), x)
         gain, frac = breath_gain(dn, depth_db=a.breath_depth)
         # --- tone & dynamics ----------------------------------------------
-        y = process(dn, TONE, tmp, "tone")
-        y = process(y, DEESS, tmp, "dess", graph=True)
+        y = process(dn, TONE_WARM if a.warm else TONE, tmp, "tone")
+        y = process(y, DEESS_WARM if a.warm else DEESS, tmp, "dess", graph=True)
         y = process(y, DEPLOSIVE, tmp, "dep", graph=True)
         y = process(y, DENSITY, tmp, "dens", graph=True)
         y = align(y, dn) * gain  # breath / smack suppression after all dynamics
